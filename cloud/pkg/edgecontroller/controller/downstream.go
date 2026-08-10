@@ -11,6 +11,7 @@ import (
 	k8sinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	clientgov1 "k8s.io/client-go/listers/core/v1"
+	nodev1listers "k8s.io/client-go/listers/node/v1"
 	"k8s.io/klog/v2"
 
 	"github.com/kubeedge/api/apis/componentconfig/cloudcore/v1alpha1"
@@ -47,6 +48,8 @@ type DownstreamController struct {
 	ruleEndpointsManager *manager.RuleEndpointManager
 
 	runtimeClassManager *manager.RuntimeClassManager
+
+	runtimeClassLister nodev1listers.RuntimeClassLister
 
 	lc *manager.LocationCache
 
@@ -249,8 +252,38 @@ func (dc *DownstreamController) syncEdgeNodes() {
 			} else {
 				klog.V(4).Infof("send message successfully, operation: %s, resource: %s", msg.GetOperation(), msg.GetResource())
 			}
+
+			if e.Type == watch.Added {
+				if err := dc.syncRuntimeClassesToNode(node.ObjectMeta.Name); err != nil {
+					klog.Errorf("failed to sync runtimeclasses to node %s: %v", node.ObjectMeta.Name, err)
+				}
+			}
 		}
 	}
+}
+
+func (dc *DownstreamController) syncRuntimeClassesToNode(nodeName string) error {
+	rcs, err := dc.runtimeClassLister.List(labels.Everything())
+	if err != nil {
+		return err
+	}
+	for _, rc := range rcs {
+		resource, err := messagelayer.BuildResource(nodeName, models.NullNamespace, model.ResourceTypeRuntimeClass, rc.Name)
+		if err != nil {
+			klog.Warningf("build message resource failed with error: %s", err)
+			continue
+		}
+		msg := model.NewMessage("").
+			SetResourceVersion(rc.ResourceVersion).
+			BuildRouter(modules.EdgeControllerModuleName, constants.GroupResource, resource, model.InsertOperation).
+			FillBody(rc)
+		if err := dc.messageLayer.Send(*msg); err != nil {
+			klog.Warningf("send message failed with error: %s, operation: %s, resource: %s", err, msg.GetOperation(), msg.GetResource())
+		} else {
+			klog.V(4).Infof("send message successfully, operation: %s, resource: %s", msg.GetOperation(), msg.GetResource())
+		}
+	}
+	return nil
 }
 
 func (dc *DownstreamController) syncRule() {
@@ -503,6 +536,7 @@ func NewDownstreamController(config *v1alpha1.EdgeController, k8sInformerFactory
 		rulesManager:         rulesManager,
 		ruleEndpointsManager: ruleEndpointsManager,
 		runtimeClassManager:  runtimeClassManager,
+		runtimeClassLister:   runtimeClassInformer.Lister(),
 	}
 	if err := dc.initLocating(); err != nil {
 		return nil, err
